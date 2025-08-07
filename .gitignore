@@ -1,0 +1,6 @@
+venv
+output
+geoip.dat
+geosite.dat
+xray.exe
+test.py
