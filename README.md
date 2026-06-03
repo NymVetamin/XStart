@@ -1,34 +1,42 @@
 # XStart
 
-Windows GUI launcher for Xray VLESS profiles.
+Windows GUI-лаунчер для Xray VLESS-профилей.
 
-## Features
+## Возможности
 
-- Import profiles from a `vless://` link.
-- Import profiles from a full Xray JSON config that contains a VLESS outbound.
-- Start and stop local `xray.exe`.
-- Local SOCKS proxy on `127.0.0.1:10808`.
-- Optional Windows TUN mode for routing machine traffic through Xray.
-- Download official Xray-core releases and Wintun with hash checks.
+- Импорт профиля из `vless://` ссылки.
+- Импорт полного JSON-конфига Xray с VLESS outbound.
+- Запуск и остановка локального `xray.exe`.
+- Локальный SOCKS-прокси на `127.0.0.1:10808`.
+- TUN-режим Windows для маршрутизации трафика машины через Xray.
+- Загрузка официальных релизов Xray-core и Wintun с проверкой хешей.
 
-## Runtime Files
+## Файлы рядом с приложением
 
-Keep these files next to `XStart.exe`:
+Рядом с `XStart.exe` должны лежать:
 
-- `xray.exe`
-- `geoip.dat`
-- `geosite.dat`
-- `wintun.dll` for TUN mode
+- `xray.exe`;
+- `geoip.dat`;
+- `geosite.dat`;
+- `wintun.dll`, если используется TUN-режим.
 
-The app can download `xray.exe`, `geoip.dat`, `geosite.dat`, and `wintun.dll` through the `Download core` button.
+Если ядро еще не загружено, нажмите `Загрузить ядро`. При попытке запуска без `xray.exe` приложение покажет понятное сообщение и предложит открыть загрузчик ядра.
 
-## TUN Mode
+## TUN-режим
 
-Xray `v26.3.27` creates the Wintun adapter but does not apply Windows routes itself. XStart prepares the required Windows routing:
+Xray `v26.3.27` создает Wintun-адаптер, но не применяет маршруты Windows сам. Поэтому XStart делает совместимую настройку:
 
-- a precise host route to the proxy endpoint through the physical network;
-- DNS and interface metric for `xstart0`;
-- `0.0.0.0/0` and `::/0` routes through `xstart0`;
-- cleanup of the routes on stop or failed start.
+- добавляет точный host-route до endpoint прокси через физическую сеть;
+- настраивает IPv4, DNS и метрику интерфейса `xstart0`;
+- добавляет маршруты `0.0.0.0/0` и `::/0` через `xstart0`;
+- удаляет добавленные маршруты при остановке или неудачном старте.
 
-TUN mode usually requires running XStart as administrator.
+TUN-режим обычно требует запуск XStart от администратора.
+
+## Сборка
+
+```powershell
+python -m PyInstaller --clean --onefile --windowed --name XStart --icon assets\xstart.ico --distpath . --workpath build --specpath build main.py
+```
+
+После сборки проверьте запуск `XStart.exe` и убедитесь, что рядом есть нужные runtime-файлы Xray.

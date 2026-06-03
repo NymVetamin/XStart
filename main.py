@@ -533,25 +533,25 @@ def find_vless_outbound(config):
     for outbound in config.get("outbounds", []):
         if outbound.get("protocol") == "vless":
             return outbound
-    raise ValueError("JSON config must contain a VLESS outbound.")
+    raise ValueError("JSON-конфиг должен содержать VLESS outbound.")
 
 
 def extract_profile_info_from_config(config):
     if not isinstance(config, dict):
-        raise ValueError("JSON config must be an object.")
+        raise ValueError("JSON-конфиг должен быть объектом.")
     if not isinstance(config.get("outbounds"), list):
-        raise ValueError("JSON config must contain an outbounds list.")
+        raise ValueError("JSON-конфиг должен содержать список outbounds.")
 
     outbound = find_vless_outbound(config)
     settings = outbound.get("settings", {})
     vnext = settings.get("vnext", [])
     if not vnext or not isinstance(vnext, list):
-        raise ValueError("VLESS outbound must contain settings.vnext.")
+        raise ValueError("VLESS outbound должен содержать settings.vnext.")
     endpoint = vnext[0]
     server = endpoint.get("address")
     port = endpoint.get("port")
     if not server or not isinstance(port, int) or port < 1 or port > 65535:
-        raise ValueError("VLESS outbound must contain a valid server and port.")
+        raise ValueError("VLESS outbound должен содержать корректные сервер и порт.")
 
     stream_settings = outbound.get("streamSettings", {})
     reality = stream_settings.get("realitySettings", {})
@@ -605,15 +605,15 @@ def normalize_imported_json_config(config):
 def parse_profile_text(raw_text):
     text = raw_text.strip()
     if not text:
-        raise ValueError("Input is empty.")
+        raise ValueError("Вставлен пустой текст.")
     if text.startswith("vless://"):
         return parse_vless_url(text)
     if len(text) > MAX_JSON_CONFIG_LENGTH:
-        raise ValueError("JSON config is too large.")
+        raise ValueError("JSON-конфиг слишком большой.")
     try:
         config = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Input is neither a VLESS link nor valid JSON: {e}") from e
+        raise ValueError(f"Это не VLESS-ссылка и не корректный JSON: {e}") from e
     config, info = normalize_imported_json_config(config)
     profile_name = info["server"]
     return profile_name, config, info
@@ -633,7 +633,7 @@ def save_profile_config(profile_name, config):
     safe_name = "".join(c for c in profile_name if c.isalnum() or c in " _-()[]").strip()
     safe_name = safe_name[:MAX_PROFILE_NAME_LENGTH].strip()
     if not safe_name:
-        raise ValueError("Profile name does not contain valid filename characters.")
+        raise ValueError("Имя профиля не содержит символов, подходящих для имени файла.")
 
     filename = os.path.join(CONFIGS_DIR, f"{safe_name}.json")
     if os.path.exists(filename):
@@ -662,12 +662,12 @@ def add_profile_from_text(raw_text, dialog=None):
         profile_name = unique_profile_name(profile_name)
         config_file = save_profile_config(profile_name, config)
     except Exception as e:
-        messagebox.showerror("Import error", f"Could not import profile:\n{e}")
+        messagebox.showerror("Ошибка импорта", f"Не удалось импортировать профиль:\n{e}")
         return
 
     profiles[profile_name] = {"config_file": config_file, "info": info}
     update_profile_list()
-    messagebox.showinfo("Imported", f"Profile '{profile_name}' was added")
+    messagebox.showinfo("Готово", f"Профиль «{profile_name}» добавлен")
     if dialog is not None:
         dialog.destroy()
 
@@ -676,14 +676,14 @@ def add_profile_from_clipboard():
     try:
         clipboard_text = root.clipboard_get().strip()
     except Exception:
-        messagebox.showerror("Clipboard error", "Could not read clipboard")
+        messagebox.showerror("Буфер обмена", "Не удалось прочитать буфер обмена")
         return
     add_profile_from_text(clipboard_text)
 
 
 def open_profile_import_dialog():
     dialog = tk.Toplevel(root)
-    dialog.title("Import profile")
+    dialog.title("Импорт профиля")
     dialog.geometry("720x500")
     dialog.minsize(620, 420)
     dialog.transient(root)
@@ -693,10 +693,10 @@ def open_profile_import_dialog():
     container = ttk.Frame(dialog, style="App.TFrame", padding=18)
     container.pack(fill="both", expand=True)
 
-    ttk.Label(container, text="Import VLESS or JSON", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(container, text="Импорт профиля", style="Title.TLabel").pack(anchor="w")
     ttk.Label(
         container,
-        text="Paste a vless:// link or a full Xray JSON config with a VLESS outbound.",
+        text="Вставьте vless:// ссылку или полный JSON-конфиг Xray с VLESS outbound.",
         style="Subtitle.TLabel",
     ).pack(anchor="w", pady=(4, 12))
 
@@ -729,13 +729,13 @@ def open_profile_import_dialog():
             input_text.delete("1.0", tk.END)
             input_text.insert("1.0", root.clipboard_get().strip())
         except Exception:
-            messagebox.showerror("Clipboard error", "Could not read clipboard")
+            messagebox.showerror("Буфер обмена", "Не удалось прочитать буфер обмена")
 
-    ttk.Button(button_frame, text="Paste clipboard", command=paste_clipboard, style="Secondary.TButton").pack(side="left")
-    ttk.Button(button_frame, text="Cancel", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+    ttk.Button(button_frame, text="Вставить из буфера", command=paste_clipboard, style="Secondary.TButton").pack(side="left")
+    ttk.Button(button_frame, text="Отмена", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
     ttk.Button(
         button_frame,
-        text="Import",
+        text="Импортировать",
         command=lambda: add_profile_from_text(input_text.get("1.0", tk.END), dialog),
         style="Accent.TButton",
     ).pack(side="right", padx=(0, 8))
@@ -765,14 +765,14 @@ def show_core_download_dialog():
         messagebox.showwarning("Предупреждение", "Остановите Xray перед загрузкой ядра")
         return
 
-    core_btn.config(state="disabled", text="Loading...")
+    core_btn.config(state="disabled", text="Загрузка...")
 
     def finish_error(error_text):
-        core_btn.config(state="normal", text="Download core")
+        core_btn.config(state="normal", text="Загрузить ядро")
         messagebox.showerror("Ошибка", f"Не удалось получить список релизов:\n{error_text}")
 
     def finish_success(releases):
-        core_btn.config(state="normal", text="Download core")
+        core_btn.config(state="normal", text="Загрузить ядро")
         open_core_release_dialog(releases)
 
     def worker():
@@ -799,7 +799,7 @@ def open_core_release_dialog(releases):
     release_list = tk.Listbox(dialog, height=6)
     release_list.pack(fill="both", expand=True, padx=10)
     for release in releases:
-        published = release["published_at"][:10] if release.get("published_at") else "date unknown"
+        published = release["published_at"][:10] if release.get("published_at") else "дата неизвестна"
         size_mb = release.get("size", 0) / 1024 / 1024
         release_list.insert(tk.END, f"{release['tag']}  |  {published}  |  {size_mb:.1f} MB")
     release_list.selection_set(0)
@@ -893,7 +893,7 @@ def run_powershell_script(script, timeout=15):
     )
     output = completed.stdout.strip()
     if completed.returncode != 0:
-        raise RuntimeError(output or f"PowerShell exited with code {completed.returncode}")
+        raise RuntimeError(output or f"PowerShell завершился с кодом {completed.returncode}")
     return output
 
 
@@ -922,7 +922,7 @@ def resolve_endpoint_ips(host):
 def prepare_tun_endpoint_routes(host):
     ips = resolve_endpoint_ips(host)
     if not ips:
-        raise RuntimeError(f"Cannot resolve proxy endpoint for TUN routing: {host}")
+        raise RuntimeError(f"Не удалось определить IP прокси для TUN-маршрута: {host}")
 
     ps_ips = "@(" + ",".join(json.dumps(ip) for ip in ips) + ")"
     script = f"""
@@ -997,7 +997,7 @@ function Invoke-WithRetry([scriptblock]$Action, [string]$Name) {{
             Start-Sleep -Milliseconds 300
         }}
     }}
-    throw "Failed to configure TUN $Name after retries: $lastError"
+    throw "Не удалось настроить TUN $Name после нескольких попыток: $lastError"
 }}
 
 function Invoke-Netsh([string[]]$NetshArgs, [string]$Name) {{
@@ -1077,35 +1077,48 @@ def update_proxy_info(profile_name):
     for widget in proxy_info_frame.winfo_children():
         widget.destroy()
 
-    ttk.Label(proxy_info_frame, text="Remote", style="Muted.TLabel").pack(anchor="w")
+    proxy_info_frame.columnconfigure(0, weight=0)
+    proxy_info_frame.columnconfigure(1, weight=1)
+
+    ttk.Label(proxy_info_frame, text="Удаленный прокси", style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
     details = [
-        ("Server", info["server"]),
-        ("Port", info["port"]),
-        ("Protocol", info["protocol"]),
-        ("Security", info["security"]),
-        ("Network", info["network"]),
+        ("Сервер", info["server"]),
+        ("Порт", info["port"]),
+        ("Протокол", info["protocol"]),
+        ("Защита", info["security"]),
+        ("Транспорт", info["network"]),
         ("SNI", info["sni"]),
         ("Fingerprint", info["fingerprint"]),
     ]
-    for label, value in details:
-        ttk.Label(proxy_info_frame, text=f"{label}: {value}", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
+    for row, (label, value) in enumerate(details, start=1):
+        ttk.Label(proxy_info_frame, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="nw", pady=3, padx=(0, 16))
+        value_label = ttk.Label(proxy_info_frame, text=str(value or "-"), style="Body.TLabel", wraplength=560)
+        value_label.grid(row=row, column=1, sticky="ew", pady=3)
 
-    ttk.Label(proxy_info_frame, text="Local SOCKS", style="Muted.TLabel").pack(anchor="w", pady=(14, 0))
-    ttk.Label(proxy_info_frame, text="127.0.0.1:10808, no auth", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
+    row = len(details) + 2
+    ttk.Label(proxy_info_frame, text="Локальный SOCKS", style="Muted.TLabel").grid(row=row, column=0, sticky="nw", pady=(14, 0), padx=(0, 16))
+    ttk.Label(proxy_info_frame, text="127.0.0.1:10808, без авторизации", style="Body.TLabel").grid(row=row, column=1, sticky="ew", pady=(14, 0))
+
+
+def render_inactive_proxy_info():
+    for widget in proxy_info_frame.winfo_children():
+        widget.destroy()
+    proxy_info_frame.columnconfigure(0, weight=1)
+    ttk.Label(proxy_info_frame, text="Прокси не запущен", style="Body.TLabel").grid(row=0, column=0, sticky="w")
 
 
 def update_ui_state(is_running):
     if is_running:
-        status_label.config(text="Running", foreground=COLORS["success"])
-        toggle_btn.config(text="Stop Xray", command=stop_xray)
+        status_label.config(text="Запущен", foreground=COLORS["success"])
+        toggle_btn.config(text="Остановить Xray", command=stop_xray)
         add_btn.config(state="disabled")
         del_btn.config(state="disabled")
         core_btn.config(state="disabled")
         tun_check.config(state="disabled")
         profile_listbox.config(state="disabled")
     else:
-        status_label.config(text="Stopped", foreground=COLORS["danger"])
-        toggle_btn.config(text="Start Xray", command=start_xray)
+        status_label.config(text="Остановлен", foreground=COLORS["danger"])
+        toggle_btn.config(text="Запустить Xray", command=start_xray)
         add_btn.config(state="normal")
         del_btn.config(state="normal")
         core_btn.config(state="normal")
@@ -1133,7 +1146,7 @@ def handle_xray_exit(process, return_code):
     stop_log_thread = True
     cleanup_runtime_config()
     update_ui_state(False)
-    append_log_line(f"\nXray exited with code {return_code}\n")
+    append_log_line(f"\nXray завершился с кодом {return_code}\n")
 
 
 def poll_log_queue():
@@ -1165,19 +1178,32 @@ def start_xray():
     global xray_process, stop_log_thread, log_thread, current_tun_enabled, current_tun_routes
 
     if xray_process is not None:
-        messagebox.showwarning("Warning", "Xray is already running")
+        messagebox.showwarning("Внимание", "Xray уже запущен")
         return
 
     selected = profile_listbox.curselection()
     if not selected:
-        messagebox.showerror("Error", "Select a profile to start")
+        messagebox.showerror("Ошибка", "Выберите профиль для запуска")
         return
 
     profile_name = profile_listbox.get(selected[0])
     config_file = profiles[profile_name]["config_file"]
 
     if not os.path.exists(config_file):
-        messagebox.showerror("Error", f"Config file not found: {config_file}")
+        messagebox.showerror("Ошибка", f"Файл конфига не найден: {config_file}")
+        return
+
+    try:
+        xray_path = get_xray_path()
+    except FileNotFoundError:
+        answer = messagebox.askyesno(
+            "Ядро не загружено",
+            "Ядро Xray не найдено рядом с приложением.\n"
+            "Сначала загрузите ядро, затем запустите профиль.\n\n"
+            "Открыть загрузку ядра сейчас?",
+        )
+        if answer:
+            show_core_download_dialog()
         return
 
     tun_enabled = tun_var.get()
@@ -1185,8 +1211,8 @@ def start_xray():
     endpoint_ips = []
     if tun_enabled:
         confirmed = messagebox.askyesno(
-            "TUN mode",
-            "TUN mode changes Windows routing and usually requires administrator rights. Continue?",
+            "TUN-режим",
+            "TUN-режим меняет маршруты Windows и обычно требует запуск от администратора.\nПродолжить?",
         )
         if not confirmed:
             return
@@ -1197,13 +1223,13 @@ def start_xray():
             pending_tun_routes.extend(endpoint_routes)
         except Exception as e:
             cleanup_tun_routes(pending_tun_routes)
-            messagebox.showerror("Error", f"Failed to prepare TUN endpoint routes:\n{e}")
+            messagebox.showerror("Ошибка", f"Не удалось подготовить маршрут до прокси:\n{e}")
             return
 
     try:
         config_file = create_runtime_config(config_file, tun_enabled)
         xray_process = subprocess.Popen(
-            [get_xray_path(), "-config", os.path.abspath(config_file)],
+            [xray_path, "-config", os.path.abspath(config_file)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1215,7 +1241,7 @@ def start_xray():
         if tun_enabled:
             pending_tun_routes.extend(configure_tun_adapter_routes())
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to start Xray:\n{e}")
+        messagebox.showerror("Ошибка", f"Не удалось запустить Xray:\n{e}")
         if xray_process is not None:
             try:
                 xray_process.terminate()
@@ -1260,8 +1286,8 @@ def start_xray():
         log_queue.put(
             (
                 "line",
-                "\n[ TUN ] Windows routes active: endpoint="
-                f"{', '.join(endpoint_ips)}; routes={', '.join(current_tun_routes)}\n",
+                "\n[ TUN ] Маршруты Windows активны: прокси="
+                f"{', '.join(endpoint_ips)}; маршруты={', '.join(current_tun_routes)}\n",
             )
         )
 
@@ -1284,12 +1310,9 @@ def stop_xray():
         cleanup_runtime_config()
         update_ui_state(False)
         
-        for widget in proxy_info_frame.winfo_children():
-            widget.destroy()
-        ttk.Label(proxy_info_frame, text="Connection", style="Muted.TLabel").pack(anchor='w', pady=(0, 5))
-        ttk.Label(proxy_info_frame, text="Proxy is not active", style="Body.TLabel").pack(anchor='w')
+        render_inactive_proxy_info()
     else:
-        messagebox.showinfo("Info", "Xray is not running")
+        messagebox.showinfo("Информация", "Xray не запущен")
 
 
 def on_close():
@@ -1299,7 +1322,6 @@ def on_close():
     root.destroy()
 
 
-# Создаем основное окно
 def configure_styles():
     style.configure("App.TFrame", background=COLORS["bg"])
     style.configure("Card.TFrame", background=COLORS["panel"], relief="flat")
@@ -1319,8 +1341,8 @@ def configure_styles():
 
 root = tk.Tk()
 root.title("XStart")
-root.geometry("980x700")
-root.minsize(900, 640)
+root.geometry("1080x760")
+root.minsize(960, 680)
 root.protocol("WM_DELETE_WINDOW", on_close)
 root.configure(bg=COLORS["bg"])
 
@@ -1328,22 +1350,20 @@ style = ttk.Style(root)
 style.theme_use("clam")
 configure_styles()
 
-main_frame = ttk.Frame(root, style="App.TFrame", padding=18)
+main_frame = ttk.Frame(root, style="App.TFrame", padding=20)
 main_frame.pack(fill="both", expand=True)
-main_frame.columnconfigure(0, weight=2, minsize=300)
-main_frame.columnconfigure(1, weight=1, minsize=220)
-main_frame.columnconfigure(2, weight=2, minsize=300)
+main_frame.columnconfigure(0, weight=0, minsize=310)
+main_frame.columnconfigure(1, weight=1, minsize=610)
 main_frame.rowconfigure(1, weight=1)
-main_frame.rowconfigure(2, weight=2)
 
 header_frame = ttk.Frame(main_frame, style="App.TFrame")
-header_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 16))
+header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
 header_frame.columnconfigure(0, weight=1)
 ttk.Label(header_frame, text="XStart", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-ttk.Label(header_frame, text="VLESS/Xray launcher with Windows TUN", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+ttk.Label(header_frame, text="Лаунчер Xray для VLESS-профилей и TUN-режима Windows", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-profiles_frame = ttk.LabelFrame(main_frame, text="Profiles", style="Panel.TLabelframe", padding=12)
-profiles_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+profiles_frame = ttk.LabelFrame(main_frame, text="Профили", style="Panel.TLabelframe", padding=14)
+profiles_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
 profiles_frame.rowconfigure(0, weight=1)
 profiles_frame.columnconfigure(0, weight=1)
 profile_listbox = tk.Listbox(
@@ -1366,30 +1386,38 @@ profile_buttons = ttk.Frame(profiles_frame, style="Card.TFrame")
 profile_buttons.grid(row=1, column=0, sticky="ew", pady=(12, 0))
 profile_buttons.columnconfigure(0, weight=1)
 profile_buttons.columnconfigure(1, weight=1)
-add_btn = ttk.Button(profile_buttons, text="Import", command=open_profile_import_dialog, style="Accent.TButton")
+add_btn = ttk.Button(profile_buttons, text="Импорт", command=open_profile_import_dialog, style="Accent.TButton")
 add_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-del_btn = ttk.Button(profile_buttons, text="Delete", command=delete_selected_profile, style="Secondary.TButton")
+del_btn = ttk.Button(profile_buttons, text="Удалить", command=delete_selected_profile, style="Secondary.TButton")
 del_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-control_frame = ttk.LabelFrame(main_frame, text="Control", style="Panel.TLabelframe", padding=14)
-control_frame.grid(row=1, column=1, sticky="nsew", padx=12)
+workspace_frame = ttk.Frame(main_frame, style="App.TFrame")
+workspace_frame.grid(row=1, column=1, sticky="nsew")
+workspace_frame.columnconfigure(0, weight=1)
+workspace_frame.rowconfigure(2, weight=1)
+
+control_frame = ttk.LabelFrame(workspace_frame, text="Управление", style="Panel.TLabelframe", padding=14)
+control_frame.grid(row=0, column=0, sticky="ew")
 control_frame.columnconfigure(0, weight=1)
-toggle_btn = ttk.Button(control_frame, text="Start Xray", command=start_xray, style="Accent.TButton")
-toggle_btn.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-status_label = ttk.Label(control_frame, text="Stopped", style="Status.TLabel")
-status_label.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+control_frame.columnconfigure(1, weight=0)
+control_frame.columnconfigure(2, weight=0)
+control_frame.columnconfigure(3, weight=0)
+toggle_btn = ttk.Button(control_frame, text="Запустить Xray", command=start_xray, style="Accent.TButton")
+toggle_btn.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+status_label = ttk.Label(control_frame, text="Остановлен", style="Status.TLabel")
+status_label.grid(row=0, column=1, sticky="w", padx=(0, 18))
 tun_var = tk.BooleanVar(value=False)
-tun_check = ttk.Checkbutton(control_frame, text="TUN mode", variable=tun_var)
-tun_check.grid(row=2, column=0, sticky="w", pady=(0, 12))
-core_btn = ttk.Button(control_frame, text="Download core", command=show_core_download_dialog, style="Secondary.TButton")
-core_btn.grid(row=3, column=0, sticky="ew")
+tun_check = ttk.Checkbutton(control_frame, text="TUN-режим", variable=tun_var)
+tun_check.grid(row=0, column=2, sticky="w", padx=(0, 12))
+core_btn = ttk.Button(control_frame, text="Загрузить ядро", command=show_core_download_dialog, style="Secondary.TButton")
+core_btn.grid(row=0, column=3, sticky="ew")
 
-proxy_info_frame = ttk.LabelFrame(main_frame, text="Connection", style="Panel.TLabelframe", padding=12)
-proxy_info_frame.grid(row=1, column=2, sticky="nsew", padx=(12, 0))
-ttk.Label(proxy_info_frame, text="Proxy is not active", style="Body.TLabel").pack(anchor="w")
+proxy_info_frame = ttk.LabelFrame(workspace_frame, text="Подключение", style="Panel.TLabelframe", padding=14)
+proxy_info_frame.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+render_inactive_proxy_info()
 
-log_frame = ttk.LabelFrame(main_frame, text="Xray log", style="Panel.TLabelframe", padding=10)
-log_frame.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(16, 0))
+log_frame = ttk.LabelFrame(workspace_frame, text="Лог Xray", style="Panel.TLabelframe", padding=10)
+log_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
 log_frame.rowconfigure(0, weight=1)
 log_frame.columnconfigure(0, weight=1)
 log_text = tk.Text(
