@@ -15,6 +15,8 @@ import shutil
 import hashlib
 import queue
 import uuid as uuid_module
+import ipaddress
+import socket
 
 xray_process = None
 log_thread = None
@@ -23,6 +25,7 @@ current_profile_info = {}
 runtime_config_file = None
 log_queue = queue.Queue()
 current_tun_enabled = False
+current_tun_bypass_prefixes = []
 
 profiles = {}
 
@@ -36,8 +39,7 @@ MAX_RELEASES_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_VLESS_URL_LENGTH = 4096
 MAX_PROFILE_NAME_LENGTH = 80
 TUN_INTERFACE_NAME = "xstart0"
-TUN_IPV4_ROUTES = ["0.0.0.0/1", "128.0.0.0/1"]
-TUN_IPV6_ROUTES = ["::/1", "8000::/1"]
+TUN_ROUTES = ["0.0.0.0/0", "::/0"]
 WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
 WINTUN_SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
 WINTUN_ZIP_MAX_BYTES = 8 * 1024 * 1024
@@ -72,7 +74,7 @@ def cleanup_runtime_config():
     runtime_config_file = None
 
 
-def create_runtime_config(config_file, tun_enabled):
+def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
     global runtime_config_file
     cleanup_runtime_config()
 
@@ -91,8 +93,8 @@ def create_runtime_config(config_file, tun_enabled):
                 "mtu": 1500,
                 "gateway": ["10.19.0.1/30", "fc00::1/126"],
                 "dns": ["1.1.1.1", "8.8.8.8"],
-                "autoSystemRoutingTable": TUN_IPV4_ROUTES + TUN_IPV6_ROUTES,
-                "autoOutboundsInterface": "auto",
+                "autoSystemRoutingTable": TUN_ROUTES,
+                "autoOutboundsInterface": outbound_interface or "auto",
             },
             "sniffing": {
                 "enabled": True,
@@ -693,67 +695,95 @@ def run_powershell_script(script, timeout=15):
     return output
 
 
-def ensure_windows_tun_routes():
-    ipv4_routes = "@(" + ",".join(f'"{route}"' for route in TUN_IPV4_ROUTES) + ")"
-    ipv6_routes = "@(" + ",".join(f'"{route}"' for route in TUN_IPV6_ROUTES) + ")"
+def resolve_endpoint_ips(host):
+    ips = []
+    try:
+        ip = ipaddress.ip_address(host)
+        return [str(ip)]
+    except ValueError:
+        pass
+
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            results = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
+        except socket.gaierror:
+            continue
+        for result in results:
+            ip = result[4][0]
+            if ip not in ips:
+                ips.append(ip)
+            if len(ips) >= 4:
+                return ips
+    return ips
+
+
+def prepare_tun_bypass_routes(host):
+    ips = resolve_endpoint_ips(host)
+    if not ips:
+        raise RuntimeError(f"Не удалось определить IP сервера {host} для защиты от TUN-loop")
+
+    ps_ips = "@(" + ",".join(f'"{ip}"' for ip in ips) + ")"
     script = f"""
 $ErrorActionPreference = 'Stop'
-$alias = '{TUN_INTERFACE_NAME}'
-$adapter = $null
-for ($i = 0; $i -lt 20; $i++) {{
-    $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue
-    if ($adapter) {{ break }}
-    Start-Sleep -Milliseconds 500
-}}
-if (-not $adapter) {{ throw "TUN adapter '$alias' was not found" }}
+$ips = {ps_ips}
+$added = @()
+$interfaceAlias = $null
 
-Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -InterfaceMetric 1 -ErrorAction SilentlyContinue | Out-Null
+try {{
+    foreach ($ip in $ips) {{
+        $best = Find-NetRoute -RemoteIPAddress $ip -ErrorAction Stop |
+            Sort-Object -Property RouteMetric, InterfaceMetric |
+            Select-Object -First 1
+        if (-not $best) {{ throw "No route to endpoint $ip" }}
+        if ($best.InterfaceAlias -eq '{TUN_INTERFACE_NAME}') {{ throw "Endpoint $ip is already routed through TUN before start" }}
+        if (-not $interfaceAlias) {{ $interfaceAlias = $best.InterfaceAlias }}
 
-$ipv4Routes = {ipv4_routes}
-foreach ($prefix in $ipv4Routes) {{
-    $route = Get-NetRoute -DestinationPrefix $prefix -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-    if (-not $route) {{
-        try {{
-            New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $adapter.ifIndex -NextHop "0.0.0.0" -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-        }} catch {{
-            & netsh interface ipv4 add route prefix=$prefix interface=$alias nexthop=0.0.0.0 metric=1 store=active | Out-Null
+        if ($ip.Contains(':')) {{
+            $prefix = "$ip/128"
+            $existing = Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
+            if (-not $existing) {{
+                New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $best.InterfaceIndex -NextHop $best.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+                $added += $prefix
+            }}
+        }} else {{
+            $prefix = "$ip/32"
+            $existing = Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
+            if (-not $existing) {{
+                New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $best.InterfaceIndex -NextHop $best.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+                $added += $prefix
+            }}
         }}
-        Write-Output "Added IPv4 TUN route $prefix via $alias"
-    }} else {{
-        Write-Output "IPv4 TUN route $prefix already exists via $alias"
     }}
+}} catch {{
+    foreach ($prefix in $added) {{
+        Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    }}
+    throw
 }}
 
-$ipv6Routes = {ipv6_routes}
-foreach ($prefix in $ipv6Routes) {{
-    $route = Get-NetRoute -DestinationPrefix $prefix -InterfaceIndex $adapter.ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue
-    if (-not $route) {{
-        try {{
-            New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $adapter.ifIndex -NextHop "::" -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-        }} catch {{
-            & netsh interface ipv6 add route prefix=$prefix interface=$alias nexthop=:: metric=1 store=active | Out-Null
-        }}
-        Write-Output "Added IPv6 TUN route $prefix via $alias"
-    }} else {{
-        Write-Output "IPv6 TUN route $prefix already exists via $alias"
-    }}
-}}
+[pscustomobject]@{{
+    InterfaceAlias = $interfaceAlias
+    AddedPrefixes = $added
+}} | ConvertTo-Json -Compress
 """
-    return run_powershell_script(script, timeout=20)
+    output = run_powershell_script(script, timeout=20)
+    data = json.loads(output)
+    prefixes = data.get("AddedPrefixes", [])
+    if isinstance(prefixes, str):
+        prefixes = [prefixes]
+    return data.get("InterfaceAlias") or "auto", prefixes, ips
 
 
-def cleanup_windows_tun_routes():
-    ipv4_routes = "@(" + ",".join(f'"{route}"' for route in TUN_IPV4_ROUTES) + ")"
-    ipv6_routes = "@(" + ",".join(f'"{route}"' for route in TUN_IPV6_ROUTES) + ")"
+def cleanup_tun_bypass_routes(prefixes):
+    if not prefixes:
+        return
+    ps_prefixes = "@(" + ",".join(f'"{prefix}"' for prefix in prefixes) + ")"
     script = f"""
 $ErrorActionPreference = 'Stop'
-$alias = '{TUN_INTERFACE_NAME}'
-$adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue
-if (-not $adapter) {{ return }}
-
-$routes = {ipv4_routes} + {ipv6_routes}
-foreach ($prefix in $routes) {{
-    Get-NetRoute -DestinationPrefix $prefix -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue |
+$prefixes = {ps_prefixes}
+foreach ($prefix in $prefixes) {{
+    Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
         Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 }}
 """
@@ -821,12 +851,13 @@ def append_log_line(line):
 
 
 def handle_xray_exit(process, return_code):
-    global xray_process, stop_log_thread, current_tun_enabled
+    global xray_process, stop_log_thread, current_tun_enabled, current_tun_bypass_prefixes
     if xray_process is not process:
         return
 
     if current_tun_enabled:
-        cleanup_windows_tun_routes()
+        cleanup_tun_bypass_routes(current_tun_bypass_prefixes)
+        current_tun_bypass_prefixes = []
         current_tun_enabled = False
     xray_process = None
     stop_log_thread = True
@@ -860,27 +891,8 @@ def clear_log_queue():
             break
 
 
-def start_tun_route_worker():
-    def worker():
-        try:
-            output = ensure_windows_tun_routes()
-            if output:
-                log_queue.put(("line", "\n[ маршруты TUN ]\n" + output + "\n"))
-        except Exception as e:
-            log_queue.put(
-                (
-                    "line",
-                    "\n[ ошибка маршрутов TUN ] Не удалось настроить full-tunnel маршруты Windows. "
-                    "Запустите приложение от администратора и проверьте PowerShell NetTCPIP.\n"
-                    f"{e}\n",
-                )
-            )
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
 def start_xray():
-    global xray_process, stop_log_thread, log_thread, current_tun_enabled
+    global xray_process, stop_log_thread, log_thread, current_tun_enabled, current_tun_bypass_prefixes
 
     if xray_process is not None:
         messagebox.showwarning("Предупреждение", "Xray уже запущен")
@@ -899,6 +911,8 @@ def start_xray():
         return
 
     tun_enabled = tun_var.get()
+    outbound_interface = "auto"
+    bypass_ips = []
     if tun_enabled:
         confirmed = messagebox.askyesno(
             "TUN режим",
@@ -908,9 +922,20 @@ def start_xray():
             return
         if not ensure_wintun_for_tun():
             return
+        try:
+            outbound_interface, current_tun_bypass_prefixes, bypass_ips = prepare_tun_bypass_routes(profiles[profile_name]["info"]["server"])
+        except Exception as e:
+            messagebox.showerror(
+                "Ошибка",
+                "Не удалось подготовить маршрут до сервера перед TUN.\n"
+                "Без этого возникает петля: Xray пытается подключиться к своему серверу через TUN.\n"
+                f"{e}",
+            )
+            current_tun_bypass_prefixes = []
+            return
 
     try:
-        config_file = create_runtime_config(config_file, tun_enabled)
+        config_file = create_runtime_config(config_file, tun_enabled, outbound_interface)
         xray_process = subprocess.Popen(
             [get_xray_path(), "-config", os.path.abspath(config_file)],
             stdout=subprocess.PIPE,
@@ -923,6 +948,9 @@ def start_xray():
         )
     except Exception as e:
         messagebox.showerror("Ошибка", f"Не удалось запустить Xray:\n{e}")
+        if tun_enabled:
+            cleanup_tun_bypass_routes(current_tun_bypass_prefixes)
+            current_tun_bypass_prefixes = []
         cleanup_runtime_config()
         xray_process = None
         return
@@ -953,14 +981,22 @@ def start_xray():
     log_thread.start()
     poll_log_queue()
     if tun_enabled:
-        start_tun_route_worker()
+        log_queue.put(
+            (
+                "line",
+                "\n[ TUN ] "
+                f"outbound interface: {outbound_interface}; endpoint IPs: {', '.join(bypass_ips)}; "
+                f"bypass routes: {', '.join(current_tun_bypass_prefixes) or 'already present'}\n",
+            )
+        )
 
 
 def stop_xray():
-    global xray_process, stop_log_thread, current_tun_enabled
+    global xray_process, stop_log_thread, current_tun_enabled, current_tun_bypass_prefixes
     if xray_process:
         if current_tun_enabled:
-            cleanup_windows_tun_routes()
+            cleanup_tun_bypass_routes(current_tun_bypass_prefixes)
+            current_tun_bypass_prefixes = []
         stop_log_thread = True
         xray_process.terminate()
         try:
