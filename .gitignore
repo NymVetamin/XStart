@@ -5,4 +5,5 @@ configs
 geoip.dat
 geosite.dat
 xray.exe
+wintun.dll
 test.py

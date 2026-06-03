@@ -12,6 +12,7 @@ import sys
 import tempfile
 import zipfile
 import shutil
+import hashlib
 
 xray_process = None
 log_thread = None
@@ -26,6 +27,9 @@ XRAY_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases"
 XRAY_ASSET_NAME = "Xray-windows-64.zip"
 DOWNLOADABLE_FILES = {"xray.exe", "geoip.dat", "geosite.dat"}
 MAX_CORE_ZIP_BYTES = 120 * 1024 * 1024
+WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+WINTUN_SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+WINTUN_ZIP_MAX_BYTES = 8 * 1024 * 1024
 if not os.path.exists(CONFIGS_DIR):
     os.makedirs(CONFIGS_DIR)
 
@@ -41,6 +45,10 @@ def get_xray_path():
     if os.path.exists(local_xray):
         return local_xray
     return "xray.exe"
+
+
+def get_wintun_path():
+    return os.path.join(get_app_dir(), "wintun.dll")
 
 
 def cleanup_runtime_config():
@@ -145,6 +153,14 @@ def validate_final_download_url(url):
         raise RuntimeError("Загрузка была перенаправлена на недоверенный URL")
 
 
+def validate_wintun_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc.lower() != "www.wintun.net":
+        raise RuntimeError("Некорректный URL загрузки Wintun")
+    if parsed.path != "/builds/wintun-0.14.1.zip":
+        raise RuntimeError("URL загрузки Wintun не относится к ожидаемому официальному архиву")
+
+
 def download_file(url, target_file):
     validate_download_url(url)
     request = Request(url, headers={"User-Agent": "XStart"})
@@ -162,6 +178,30 @@ def download_file(url, target_file):
             if downloaded > MAX_CORE_ZIP_BYTES:
                 raise RuntimeError("Архив ядра слишком большой")
             f.write(chunk)
+
+
+def download_wintun_zip(target_file):
+    validate_wintun_url(WINTUN_URL)
+    request = Request(WINTUN_URL, headers={"User-Agent": "XStart"})
+    downloaded = 0
+    digest = hashlib.sha256()
+    with urlopen(request, timeout=60) as response, open(target_file, "wb") as f:
+        validate_wintun_url(response.geturl())
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > WINTUN_ZIP_MAX_BYTES:
+            raise RuntimeError("Архив Wintun слишком большой")
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            downloaded += len(chunk)
+            if downloaded > WINTUN_ZIP_MAX_BYTES:
+                raise RuntimeError("Архив Wintun слишком большой")
+            digest.update(chunk)
+            f.write(chunk)
+
+    if digest.hexdigest().lower() != WINTUN_SHA256:
+        raise RuntimeError("SHA256 архива Wintun не совпал с официальным значением")
 
 
 def extract_xray_core(zip_path):
@@ -193,6 +233,43 @@ def extract_xray_core(zip_path):
     return extracted
 
 
+def extract_wintun_dll(zip_path):
+    target_path = get_wintun_path()
+    temp_target = target_path + ".download"
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        member = next(
+            (
+                item
+                for item in archive.infolist()
+                if item.filename.replace("\\", "/").lower() == "wintun/bin/amd64/wintun.dll"
+                and not item.is_dir()
+            ),
+            None,
+        )
+        if not member:
+            raise RuntimeError("В архиве Wintun не найден bin/amd64/wintun.dll")
+        if member.file_size > WINTUN_ZIP_MAX_BYTES:
+            raise RuntimeError("wintun.dll в архиве слишком большой")
+        try:
+            with archive.open(member, "r") as source, open(temp_target, "wb") as target:
+                shutil.copyfileobj(source, target)
+            os.replace(temp_target, target_path)
+        finally:
+            if os.path.exists(temp_target):
+                try:
+                    os.remove(temp_target)
+                except OSError:
+                    pass
+    return {"wintun.dll"}
+
+
+def download_wintun_dll():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, "wintun-0.14.1.zip")
+        download_wintun_zip(zip_path)
+        return extract_wintun_dll(zip_path)
+
+
 def download_core_release(release):
     if xray_process is not None:
         raise RuntimeError("Остановите Xray перед обновлением ядра")
@@ -200,7 +277,9 @@ def download_core_release(release):
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_path = os.path.join(temp_dir, XRAY_ASSET_NAME)
         download_file(release["download_url"], zip_path)
-        return extract_xray_core(zip_path)
+        extracted = extract_xray_core(zip_path)
+    extracted.update(download_wintun_dll())
+    return extracted
 
 
 def load_existing_profiles():
@@ -494,6 +573,33 @@ def open_core_release_dialog(releases):
     cancel_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
 
+def ensure_wintun_for_tun():
+    if os.path.exists(get_wintun_path()):
+        return True
+
+    answer = messagebox.askyesno(
+        "Нужен Wintun",
+        "Для TUN режима на Windows нужен wintun.dll рядом с xray.exe.\n"
+        "Скачать официальный Wintun 0.14.1 с проверкой SHA256 сейчас?",
+    )
+    if not answer:
+        return False
+
+    root.config(cursor="watch")
+    root.update_idletasks()
+    try:
+        download_wintun_dll()
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось скачать wintun.dll:\n{e}")
+        return False
+    finally:
+        root.config(cursor="")
+        root.update_idletasks()
+
+    messagebox.showinfo("Готово", "wintun.dll загружен рядом с приложением")
+    return True
+
+
 def update_proxy_info(profile_name):
     global current_profile_info
     
@@ -570,6 +676,8 @@ def start_xray():
             "TUN режим изменяет системную маршрутизацию и обычно требует запуск от администратора.\nПродолжить?",
         )
         if not confirmed:
+            return
+        if not ensure_wintun_for_tun():
             return
 
     try:
