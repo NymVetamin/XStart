@@ -13,20 +13,27 @@ import tempfile
 import zipfile
 import shutil
 import hashlib
+import queue
+import uuid as uuid_module
 
 xray_process = None
 log_thread = None
 stop_log_thread = False
 current_profile_info = {}
 runtime_config_file = None
+log_queue = queue.Queue()
 
 profiles = {}
 
 CONFIGS_DIR = "configs"
-XRAY_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases"
+XRAY_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=20"
 XRAY_ASSET_NAME = "Xray-windows-64.zip"
 DOWNLOADABLE_FILES = {"xray.exe", "geoip.dat", "geosite.dat"}
 MAX_CORE_ZIP_BYTES = 120 * 1024 * 1024
+MAX_EXTRACTED_FILE_BYTES = 120 * 1024 * 1024
+MAX_RELEASES_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_VLESS_URL_LENGTH = 4096
+MAX_PROFILE_NAME_LENGTH = 80
 WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
 WINTUN_SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
 WINTUN_ZIP_MAX_BYTES = 8 * 1024 * 1024
@@ -42,9 +49,9 @@ def get_app_dir():
 
 def get_xray_path():
     local_xray = os.path.join(get_app_dir(), "xray.exe")
-    if os.path.exists(local_xray):
-        return local_xray
-    return "xray.exe"
+    if not os.path.exists(local_xray):
+        raise FileNotFoundError("xray.exe не найден рядом с приложением. Нажмите 'Загрузить ядро'.")
+    return local_xray
 
 
 def get_wintun_path():
@@ -112,7 +119,10 @@ def fetch_xray_releases():
         },
     )
     with urlopen(request, timeout=20) as response:
-        releases = json.loads(response.read().decode("utf-8"))
+        body = response.read(MAX_RELEASES_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RELEASES_RESPONSE_BYTES:
+            raise RuntimeError("Ответ GitHub API слишком большой")
+        releases = json.loads(body.decode("utf-8"))
 
     result = []
     for release in releases:
@@ -121,6 +131,10 @@ def fetch_xray_releases():
         asset = next((item for item in release.get("assets", []) if item.get("name") == XRAY_ASSET_NAME), None)
         if not asset:
             continue
+        try:
+            validate_sha256_digest(asset.get("digest", ""))
+        except RuntimeError:
+            continue
         result.append(
             {
                 "tag": release.get("tag_name", "unknown"),
@@ -128,6 +142,7 @@ def fetch_xray_releases():
                 "published_at": release.get("published_at", ""),
                 "download_url": asset.get("browser_download_url", ""),
                 "size": asset.get("size", 0),
+                "digest": asset.get("digest", ""),
             }
         )
         if len(result) == 4:
@@ -161,10 +176,23 @@ def validate_wintun_url(url):
         raise RuntimeError("URL загрузки Wintun не относится к ожидаемому официальному архиву")
 
 
-def download_file(url, target_file):
+def validate_sha256_digest(digest):
+    if not digest:
+        return ""
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
+        raise RuntimeError("Некорректный digest релиза")
+    value = digest.split(":", 1)[1].lower()
+    if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise RuntimeError("Некорректный SHA256 digest релиза")
+    return value
+
+
+def download_file(url, target_file, expected_digest=""):
     validate_download_url(url)
+    expected_sha256 = validate_sha256_digest(expected_digest)
     request = Request(url, headers={"User-Agent": "XStart"})
     downloaded = 0
+    digest = hashlib.sha256()
     with urlopen(request, timeout=60) as response, open(target_file, "wb") as f:
         validate_final_download_url(response.geturl())
         content_length = response.headers.get("Content-Length")
@@ -177,7 +205,11 @@ def download_file(url, target_file):
             downloaded += len(chunk)
             if downloaded > MAX_CORE_ZIP_BYTES:
                 raise RuntimeError("Архив ядра слишком большой")
+            digest.update(chunk)
             f.write(chunk)
+
+    if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
+        raise RuntimeError("SHA256 архива Xray не совпал с digest релиза GitHub")
 
 
 def download_wintun_zip(target_file):
@@ -204,26 +236,27 @@ def download_wintun_zip(target_file):
         raise RuntimeError("SHA256 архива Wintun не совпал с официальным значением")
 
 
-def extract_xray_core(zip_path):
-    app_dir = get_app_dir()
+def extract_xray_core(zip_path, target_dir):
     extracted = set()
     with zipfile.ZipFile(zip_path, "r") as archive:
         for member in archive.infolist():
             filename = os.path.basename(member.filename).lower()
             if filename not in DOWNLOADABLE_FILES or member.is_dir():
                 continue
-            if member.file_size > MAX_CORE_ZIP_BYTES:
+            if filename in extracted:
+                raise RuntimeError(f"В архиве найден дубликат файла {filename}")
+            if member.file_size > MAX_EXTRACTED_FILE_BYTES:
                 raise RuntimeError("Файл в архиве слишком большой")
-            target_path = os.path.join(app_dir, filename)
-            temp_target = target_path + ".download"
+            target_path = os.path.join(target_dir, filename)
             try:
-                with archive.open(member, "r") as source, open(temp_target, "wb") as target:
+                with archive.open(member, "r") as source, open(target_path, "wb") as target:
                     shutil.copyfileobj(source, target)
-                os.replace(temp_target, target_path)
+                if os.path.getsize(target_path) != member.file_size:
+                    raise RuntimeError(f"Размер извлеченного файла не совпал: {filename}")
             finally:
-                if os.path.exists(temp_target):
+                if os.path.exists(target_path) and os.path.getsize(target_path) != member.file_size:
                     try:
-                        os.remove(temp_target)
+                        os.remove(target_path)
                     except OSError:
                         pass
             extracted.add(filename)
@@ -233,9 +266,8 @@ def extract_xray_core(zip_path):
     return extracted
 
 
-def extract_wintun_dll(zip_path):
-    target_path = get_wintun_path()
-    temp_target = target_path + ".download"
+def extract_wintun_dll(zip_path, target_dir):
+    target_path = os.path.join(target_dir, "wintun.dll")
     with zipfile.ZipFile(zip_path, "r") as archive:
         member = next(
             (
@@ -251,23 +283,41 @@ def extract_wintun_dll(zip_path):
         if member.file_size > WINTUN_ZIP_MAX_BYTES:
             raise RuntimeError("wintun.dll в архиве слишком большой")
         try:
-            with archive.open(member, "r") as source, open(temp_target, "wb") as target:
+            with archive.open(member, "r") as source, open(target_path, "wb") as target:
                 shutil.copyfileobj(source, target)
-            os.replace(temp_target, target_path)
+            if os.path.getsize(target_path) != member.file_size:
+                raise RuntimeError("Размер извлеченного wintun.dll не совпал")
         finally:
-            if os.path.exists(temp_target):
+            if os.path.exists(target_path) and os.path.getsize(target_path) != member.file_size:
                 try:
-                    os.remove(temp_target)
+                    os.remove(target_path)
                 except OSError:
                     pass
     return {"wintun.dll"}
 
 
+def install_downloaded_files(stage_dir, filenames):
+    app_dir = get_app_dir()
+    installed = set()
+    for filename in sorted(filenames):
+        if filename not in DOWNLOADABLE_FILES and filename != "wintun.dll":
+            raise RuntimeError(f"Недопустимый файл для установки: {filename}")
+        source_path = os.path.join(stage_dir, filename)
+        if not os.path.isfile(source_path):
+            raise RuntimeError(f"Подготовленный файл не найден: {filename}")
+        os.replace(source_path, os.path.join(app_dir, filename))
+        installed.add(filename)
+    return installed
+
+
 def download_wintun_dll():
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_path = os.path.join(temp_dir, "wintun-0.14.1.zip")
+        stage_dir = os.path.join(temp_dir, "stage")
+        os.makedirs(stage_dir)
         download_wintun_zip(zip_path)
-        return extract_wintun_dll(zip_path)
+        extracted = extract_wintun_dll(zip_path, stage_dir)
+        return install_downloaded_files(stage_dir, extracted)
 
 
 def download_core_release(release):
@@ -276,10 +326,14 @@ def download_core_release(release):
 
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_path = os.path.join(temp_dir, XRAY_ASSET_NAME)
-        download_file(release["download_url"], zip_path)
-        extracted = extract_xray_core(zip_path)
-    extracted.update(download_wintun_dll())
-    return extracted
+        wintun_zip_path = os.path.join(temp_dir, "wintun-0.14.1.zip")
+        stage_dir = os.path.join(temp_dir, "stage")
+        os.makedirs(stage_dir)
+        download_file(release["download_url"], zip_path, release.get("digest", ""))
+        extracted = extract_xray_core(zip_path, stage_dir)
+        download_wintun_zip(wintun_zip_path)
+        extracted.update(extract_wintun_dll(wintun_zip_path, stage_dir))
+        return install_downloaded_files(stage_dir, extracted)
 
 
 def load_existing_profiles():
@@ -320,12 +374,21 @@ def load_existing_profiles():
 
 
 def parse_vless_url(vless_url):
+    if len(vless_url) > MAX_VLESS_URL_LENGTH:
+        raise ValueError("VLESS-ссылка слишком длинная.")
+
     if not vless_url.startswith("vless://"):
         raise ValueError("Это не VLESS-ссылка.")
 
     full_url = vless_url[8:]
     base, _, comment = full_url.partition('#')
     uuid, _, server_part = base.partition('@')
+    if not uuid or not server_part:
+        raise ValueError("Неверный формат VLESS-ссылки.")
+    try:
+        str(uuid_module.UUID(uuid))
+    except Exception:
+        raise ValueError("Неверный UUID в VLESS-ссылке.")
 
     if '?' in server_part:
         host_port, query_string = server_part.split('?', 1)
@@ -337,6 +400,8 @@ def parse_vless_url(vless_url):
         raise ValueError("Неверный формат: отсутствует порт.")
     host, port = host_port.split(':', 1)
     port = int(port)
+    if port < 1 or port > 65535:
+        raise ValueError("Порт должен быть в диапазоне 1-65535.")
     params = parse_qs(query_string)
 
     def get_param(name, default=""):
@@ -427,7 +492,12 @@ def parse_vless_url(vless_url):
 
 def save_profile_config(profile_name, config):
     safe_name = "".join(c for c in profile_name if c.isalnum() or c in " _-()[]").strip()
+    safe_name = safe_name[:MAX_PROFILE_NAME_LENGTH].strip()
+    if not safe_name:
+        raise ValueError("Имя профиля не содержит допустимых символов.")
     filename = os.path.join(CONFIGS_DIR, f"{safe_name}.json")
+    if os.path.exists(filename):
+        raise FileExistsError(f"Файл профиля уже существует: {filename}")
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
     return filename
@@ -456,7 +526,11 @@ def add_profile_from_clipboard():
         messagebox.showinfo("Инфо", f"Профиль с именем '{profile_name}' уже существует")
         return
 
-    config_file = save_profile_config(profile_name, config)
+    try:
+        config_file = save_profile_config(profile_name, config)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось сохранить профиль:\n{e}")
+        return
     profiles[profile_name] = {"config_file": config_file, "info": info}
     update_profile_list()
     messagebox.showinfo("Успех", f"Профиль '{profile_name}' добавлен")
@@ -650,6 +724,50 @@ def update_ui_state(is_running):
         profile_listbox.config(state="normal")
 
 
+def append_log_line(line):
+    log_text.config(state="normal")
+    log_text.insert(tk.END, line)
+    log_text.see(tk.END)
+    log_text.config(state="disabled")
+
+
+def handle_xray_exit(process, return_code):
+    global xray_process, stop_log_thread
+    if xray_process is not process:
+        return
+
+    xray_process = None
+    stop_log_thread = True
+    cleanup_runtime_config()
+    update_ui_state(False)
+    append_log_line(f"\nXray завершился с кодом {return_code}\n")
+
+
+def poll_log_queue():
+    while True:
+        try:
+            item = log_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        kind = item[0]
+        if kind == "line":
+            append_log_line(item[1])
+        elif kind == "exit":
+            handle_xray_exit(item[1], item[2])
+
+    if xray_process is not None or not log_queue.empty():
+        root.after(100, poll_log_queue)
+
+
+def clear_log_queue():
+    while True:
+        try:
+            log_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
 def start_xray():
     global xray_process, stop_log_thread, log_thread
 
@@ -705,22 +823,23 @@ def start_xray():
     log_text.delete("1.0", tk.END)
     log_text.config(state="disabled")
 
+    clear_log_queue()
     stop_log_thread = False
 
-    def read_log():
-        global stop_log_thread, xray_process
+    def read_log(process):
+        global stop_log_thread
         while not stop_log_thread:
-            line = xray_process.stdout.readline()
+            line = process.stdout.readline()
             if line:
-                log_text.config(state="normal")
-                log_text.insert(tk.END, line)
-                log_text.see(tk.END)
-                log_text.config(state="disabled")
+                log_queue.put(("line", line))
             else:
                 break
+        return_code = process.wait()
+        log_queue.put(("exit", process, return_code))
 
-    log_thread = threading.Thread(target=read_log, daemon=True)
+    log_thread = threading.Thread(target=read_log, args=(xray_process,), daemon=True)
     log_thread.start()
+    poll_log_queue()
 
 
 def stop_xray():
@@ -728,7 +847,11 @@ def stop_xray():
     if xray_process:
         stop_log_thread = True
         xray_process.terminate()
-        xray_process.wait()
+        try:
+            xray_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            xray_process.kill()
+            xray_process.wait(timeout=5)
         xray_process = None
         cleanup_runtime_config()
         update_ui_state(False)

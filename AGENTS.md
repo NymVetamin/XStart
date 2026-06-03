@@ -58,7 +58,7 @@ wintun.dll     # Wintun DLL для Xray TUN на Windows, не должна хр
 python main.py
 ```
 
-Для полноценной проверки запуска Xray рядом с `main.py` должен быть доступен `xray.exe`, либо `xray.exe` должен находиться в `PATH`. Для правил маршрутизации в генерируемом конфиге нужны `geoip.dat` и `geosite.dat` из релиза Xray-core. Для TUN на Windows рядом с `xray.exe` также нужен `wintun.dll`.
+Для полноценной проверки запуска Xray рядом с `main.py` должен быть доступен локальный `xray.exe`; запуск из `PATH` намеренно не используется из-за риска подмены. Для правил маршрутизации в генерируемом конфиге нужны `geoip.dat` и `geosite.dat` из релиза Xray-core. Для TUN на Windows рядом с `xray.exe` также нужен `wintun.dll`.
 
 Приложение создает папку `configs/` при импорте/старте, если она отсутствует.
 
@@ -97,7 +97,7 @@ pyinstaller --onefile --windowed --name XStart main.py
 - `delete_selected_profile()` - удаляет выбранный профиль из `profiles` и файл конфига с диска.
 - `update_proxy_info(profile_name)` - перерисовывает правую панель информации о прокси.
 - `update_ui_state(is_running)` - переключает состояние кнопок и статус при старте/остановке Xray.
-- `start_xray()` - проверяет выбранный профиль, запускает `xray.exe -config <config_file>`, стартует поток чтения логов.
+- `start_xray()` - проверяет выбранный профиль, запускает локальный `xray.exe -config <config_file>`, стартует поток чтения логов.
 - `stop_xray()` - завершает процесс Xray, сбрасывает UI и информацию о прокси.
 
 GUI создается внизу файла на верхнем уровне, затем вызываются `load_existing_profiles()`, `update_profile_list()` и `root.mainloop()`.
@@ -181,7 +181,7 @@ vless://<uuid>@<host>:<port>?type=<network>&security=reality&sni=<sni>&pbk=<publ
 
 ```python
 subprocess.Popen(
-    ["xray.exe", "-config", config_file],
+    [get_xray_path(), "-config", os.path.abspath(config_file)],
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     text=True,
@@ -193,9 +193,9 @@ subprocess.Popen(
 
 `creationflags=0x08000000` скрывает консольное окно на Windows (`CREATE_NO_WINDOW`).
 
-Логи читаются в daemon-потоке через `xray_process.stdout.readline()` и вставляются напрямую в `tk.Text`.
+Логи читаются в daemon-потоке через `xray_process.stdout.readline()`, передаются в `log_queue`, а UI обновляется в основном Tkinter-потоке через `root.after(...)`.
 
-Важный риск: Tkinter не является thread-safe. Сейчас фоновый поток напрямую меняет `log_text`. При активной доработке логов лучше передавать строки в основной поток через `queue.Queue` + `root.after(...)`.
+Важно: Tkinter не является thread-safe, поэтому не возвращайте прямые вызовы `log_text` из фонового потока.
 
 ## UI
 
@@ -246,10 +246,7 @@ python -m py_compile main.py
 - Нет воспроизводимого сценария сборки exe.
 - `requirements.txt` не соответствует фактическим импортам.
 - `main.py` нельзя безопасно импортировать в тестах из-за создания GUI на верхнем уровне.
-- Tkinter обновляется из фонового потока логов.
-- `xray.exe` ищется только как `"xray.exe"` относительно текущей рабочей директории или `PATH`; рядом с exe при запуске из другого cwd может не найтись.
-- Нет обработки аварийного завершения Xray с обновлением UI после падения процесса.
-- Нет защиты от перезаписи файла, если разные имена профилей после фильтрации дают одинаковый safe filename.
+- `xray.exe` должен лежать рядом с приложением; fallback в `PATH` намеренно запрещен.
 - Нет поддержки редактирования профиля.
 - Нет проверки занятости локального порта `10808`.
 - README в текущем терминале может отображаться с mojibake; при правках сохраняйте UTF-8.
@@ -266,7 +263,7 @@ python -m py_compile main.py
   - README;
   - этот документ.
 - Если добавляете тесты, начните с извлечения чистой логики из GUI-инициализации.
-- Для серьезной доработки логов или мониторинга процесса сначала исправьте thread-safety Tkinter.
+- Для серьезной доработки логов или мониторинга процесса сохраняйте схему `queue.Queue` + `root.after(...)`, не обновляйте Tkinter из worker-потоков.
 - Для UX-изменений учитывайте, что приложение Windows-only из-за `xray.exe`, `creationflags` и модели распространения через `.exe`.
 
 ## Быстрая карта файлов
@@ -336,11 +333,12 @@ https://api.github.com/repos/XTLS/Xray-core/releases
 
 - исходный URL должен быть `https://github.com/XTLS/Xray-core/releases/download/...`;
 - после редиректа финальный URL должен остаться на `github.com` или `*.githubusercontent.com`;
+- Xray asset должен иметь GitHub `digest` формата `sha256:<64 hex>`, и скачанный zip должен ему соответствовать;
 - лимит zip - `120 MB`;
 - из архива Xray извлекаются только `xray.exe`, `geoip.dat`, `geosite.dat`;
 - для TUN дополнительно скачивается официальный `https://www.wintun.net/builds/wintun-0.14.1.zip`, проверяется SHA256 `07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51`, затем извлекается только `wintun/bin/amd64/wintun.dll`;
 - пути внутри zip отбрасываются через `os.path.basename`, path traversal не используется;
-- временный файл `<name>.download` удаляется при ошибке;
+- все файлы сначала извлекаются в staging-папку внутри системной temp-папки, затем устанавливаются через `os.replace`;
 - обновление запрещено, пока текущий `xray_process` запущен.
 
-Оставшийся риск: checksum/signature скачанного Xray asset сейчас не проверяется. Wintun zip проверяется по опубликованному SHA256. Если добавляете checksum для Xray, используйте официальный источник Xray-core и не ослабляйте allowlist файлов.
+Xray zip проверяется по GitHub asset `digest`, Wintun zip проверяется по опубликованному SHA256. Не ослабляйте эти проверки и allowlist файлов.
