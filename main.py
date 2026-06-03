@@ -39,7 +39,7 @@ MAX_RELEASES_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_VLESS_URL_LENGTH = 4096
 MAX_PROFILE_NAME_LENGTH = 80
 TUN_INTERFACE_NAME = "xstart0"
-TUN_ROUTES = ["0.0.0.0/0", "::/0"]
+TUN_ROUTES = ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]
 WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
 WINTUN_SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
 WINTUN_ZIP_MAX_BYTES = 8 * 1024 * 1024
@@ -84,6 +84,14 @@ def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
     with open(config_file, "r", encoding="utf-8") as f:
         config = json.load(f)
 
+    config["dns"] = {
+        "servers": [
+            {"address": "1.1.1.1", "port": 53},
+            {"address": "8.8.8.8", "port": 53},
+        ],
+        "queryStrategy": "UseIP",
+    }
+
     config.setdefault("inbounds", []).append(
         {
             "tag": "tun-in",
@@ -103,11 +111,32 @@ def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
         }
     )
 
+    outbounds = config.setdefault("outbounds", [])
+    if not any(outbound.get("tag") == "dns-out" for outbound in outbounds):
+        outbounds.append({"tag": "dns-out", "protocol": "dns"})
+
     routing = config.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
-    has_tun_rule = any("tun-in" in rule.get("inboundTag", []) for rule in rules if isinstance(rule.get("inboundTag"), list))
+    has_dns_rule = any(rule.get("outboundTag") == "dns-out" and "tun-in" in rule.get("inboundTag", []) for rule in rules if isinstance(rule.get("inboundTag"), list))
+    if not has_dns_rule:
+        rules.insert(
+            0,
+            {
+                "type": "field",
+                "inboundTag": ["tun-in"],
+                "network": "tcp,udp",
+                "port": "53",
+                "outboundTag": "dns-out",
+            },
+        )
+        has_dns_rule = True
+    has_tun_rule = any(
+        rule.get("outboundTag") == "vless-reality" and "tun-in" in rule.get("inboundTag", [])
+        for rule in rules
+        if isinstance(rule.get("inboundTag"), list)
+    )
     if not has_tun_rule:
-        rules.insert(0, {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "vless-reality"})
+        rules.insert(1 if has_dns_rule else 0, {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "vless-reality"})
 
     fd, runtime_path = tempfile.mkstemp(prefix="xstart-runtime-", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -681,11 +710,14 @@ def ensure_wintun_for_tun():
 
 
 def run_powershell_script(script, timeout=15):
+    utf8_script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n$OutputEncoding = [System.Text.Encoding]::UTF8\n" + script
     completed = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", utf8_script],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         creationflags=0x08000000,
     )
