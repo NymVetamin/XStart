@@ -1,5 +1,7 @@
 venv
 output
+__pycache__
+configs
 geoip.dat
 geosite.dat
 xray.exe

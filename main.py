@@ -3,20 +3,204 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
 from urllib.parse import parse_qs, unquote
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 import os
 import threading
 import glob
+import sys
+import tempfile
+import zipfile
+import shutil
 
 xray_process = None
 log_thread = None
 stop_log_thread = False
 current_profile_info = {}
+runtime_config_file = None
 
 profiles = {}
 
 CONFIGS_DIR = "configs"
+XRAY_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases"
+XRAY_ASSET_NAME = "Xray-windows-64.zip"
+DOWNLOADABLE_FILES = {"xray.exe", "geoip.dat", "geosite.dat"}
+MAX_CORE_ZIP_BYTES = 120 * 1024 * 1024
 if not os.path.exists(CONFIGS_DIR):
     os.makedirs(CONFIGS_DIR)
+
+
+def get_app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_xray_path():
+    local_xray = os.path.join(get_app_dir(), "xray.exe")
+    if os.path.exists(local_xray):
+        return local_xray
+    return "xray.exe"
+
+
+def cleanup_runtime_config():
+    global runtime_config_file
+    if runtime_config_file and os.path.exists(runtime_config_file):
+        try:
+            os.remove(runtime_config_file)
+        except OSError:
+            pass
+    runtime_config_file = None
+
+
+def create_runtime_config(config_file, tun_enabled):
+    global runtime_config_file
+    cleanup_runtime_config()
+
+    if not tun_enabled:
+        return config_file
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    config.setdefault("inbounds", []).append(
+        {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {
+                "name": "xstart0",
+                "mtu": 1500,
+                "gateway": ["10.19.0.1/30", "fc00::1/126"],
+                "dns": ["1.1.1.1", "8.8.8.8"],
+                "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
+                "autoOutboundsInterface": "auto",
+            },
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["http", "tls", "quic"],
+            },
+        }
+    )
+
+    routing = config.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    has_tun_rule = any("tun-in" in rule.get("inboundTag", []) for rule in rules if isinstance(rule.get("inboundTag"), list))
+    if not has_tun_rule:
+        rules.insert(0, {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "vless-reality"})
+
+    fd, runtime_path = tempfile.mkstemp(prefix="xstart-runtime-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
+    runtime_config_file = runtime_path
+    return runtime_path
+
+
+def fetch_xray_releases():
+    request = Request(
+        XRAY_RELEASES_API,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "XStart",
+        },
+    )
+    with urlopen(request, timeout=20) as response:
+        releases = json.loads(response.read().decode("utf-8"))
+
+    result = []
+    for release in releases:
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        asset = next((item for item in release.get("assets", []) if item.get("name") == XRAY_ASSET_NAME), None)
+        if not asset:
+            continue
+        result.append(
+            {
+                "tag": release.get("tag_name", "unknown"),
+                "name": release.get("name") or release.get("tag_name", "unknown"),
+                "published_at": release.get("published_at", ""),
+                "download_url": asset.get("browser_download_url", ""),
+                "size": asset.get("size", 0),
+            }
+        )
+        if len(result) == 4:
+            break
+
+    if not result:
+        raise RuntimeError("Не найдены подходящие релизы с Xray-windows-64.zip")
+    return result
+
+
+def validate_download_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        raise RuntimeError("Некорректный URL загрузки релиза")
+    if not parsed.path.startswith("/XTLS/Xray-core/releases/download/"):
+        raise RuntimeError("URL загрузки не относится к официальному XTLS/Xray-core")
+
+
+def validate_final_download_url(url):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if parsed.scheme != "https" or not (host == "github.com" or host.endswith(".githubusercontent.com")):
+        raise RuntimeError("Загрузка была перенаправлена на недоверенный URL")
+
+
+def download_file(url, target_file):
+    validate_download_url(url)
+    request = Request(url, headers={"User-Agent": "XStart"})
+    downloaded = 0
+    with urlopen(request, timeout=60) as response, open(target_file, "wb") as f:
+        validate_final_download_url(response.geturl())
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_CORE_ZIP_BYTES:
+            raise RuntimeError("Архив ядра слишком большой")
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            downloaded += len(chunk)
+            if downloaded > MAX_CORE_ZIP_BYTES:
+                raise RuntimeError("Архив ядра слишком большой")
+            f.write(chunk)
+
+
+def extract_xray_core(zip_path):
+    app_dir = get_app_dir()
+    extracted = set()
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for member in archive.infolist():
+            filename = os.path.basename(member.filename).lower()
+            if filename not in DOWNLOADABLE_FILES or member.is_dir():
+                continue
+            if member.file_size > MAX_CORE_ZIP_BYTES:
+                raise RuntimeError("Файл в архиве слишком большой")
+            target_path = os.path.join(app_dir, filename)
+            temp_target = target_path + ".download"
+            try:
+                with archive.open(member, "r") as source, open(temp_target, "wb") as target:
+                    shutil.copyfileobj(source, target)
+                os.replace(temp_target, target_path)
+            finally:
+                if os.path.exists(temp_target):
+                    try:
+                        os.remove(temp_target)
+                    except OSError:
+                        pass
+            extracted.add(filename)
+
+    if "xray.exe" not in extracted:
+        raise RuntimeError("В архиве не найден xray.exe")
+    return extracted
+
+
+def download_core_release(release):
+    if xray_process is not None:
+        raise RuntimeError("Остановите Xray перед обновлением ядра")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, XRAY_ASSET_NAME)
+        download_file(release["download_url"], zip_path)
+        return extract_xray_core(zip_path)
 
 
 def load_existing_profiles():
@@ -218,6 +402,98 @@ def delete_selected_profile():
     update_profile_list()
 
 
+def show_core_download_dialog():
+    if xray_process is not None:
+        messagebox.showwarning("Предупреждение", "Остановите Xray перед загрузкой ядра")
+        return
+
+    core_btn.config(state="disabled", text="Загрузка списка...")
+
+    def finish_error(error_text):
+        core_btn.config(state="normal", text="Загрузить ядро")
+        messagebox.showerror("Ошибка", f"Не удалось получить список релизов:\n{error_text}")
+
+    def finish_success(releases):
+        core_btn.config(state="normal", text="Загрузить ядро")
+        open_core_release_dialog(releases)
+
+    def worker():
+        try:
+            releases = fetch_xray_releases()
+        except Exception as e:
+            root.after(0, lambda: finish_error(str(e)))
+            return
+        root.after(0, lambda: finish_success(releases))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def open_core_release_dialog(releases):
+    dialog = tk.Toplevel(root)
+    dialog.title("Загрузка ядра Xray")
+    dialog.geometry("460x260")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    ttk.Label(dialog, text="Выберите версию Xray-core:").pack(anchor="w", padx=10, pady=(10, 5))
+
+    release_list = tk.Listbox(dialog, height=6)
+    release_list.pack(fill="both", expand=True, padx=10)
+    for release in releases:
+        published = release["published_at"][:10] if release.get("published_at") else "date unknown"
+        size_mb = release.get("size", 0) / 1024 / 1024
+        release_list.insert(tk.END, f"{release['tag']}  |  {published}  |  {size_mb:.1f} MB")
+    release_list.selection_set(0)
+
+    status = ttk.Label(dialog, text="")
+    status.pack(anchor="w", padx=10, pady=(6, 0))
+
+    button_frame = ttk.Frame(dialog)
+    button_frame.pack(fill="x", padx=10, pady=10)
+
+    def close_dialog():
+        dialog.destroy()
+
+    def start_download():
+        selected = release_list.curselection()
+        if not selected:
+            messagebox.showwarning("Внимание", "Выберите версию для загрузки", parent=dialog)
+            return
+        release = releases[selected[0]]
+        download_btn.config(state="disabled")
+        cancel_btn.config(state="disabled")
+        release_list.config(state="disabled")
+        status.config(text=f"Скачивание {release['tag']}...")
+
+        def finish_download(error_text=None, extracted=None):
+            if error_text:
+                download_btn.config(state="normal")
+                cancel_btn.config(state="normal")
+                release_list.config(state="normal")
+                status.config(text="")
+                messagebox.showerror("Ошибка", f"Не удалось загрузить ядро:\n{error_text}", parent=dialog)
+                return
+            dialog.destroy()
+            files = ", ".join(sorted(extracted))
+            messagebox.showinfo("Готово", f"Ядро Xray загружено.\nФайлы: {files}", parent=root)
+
+        def worker():
+            try:
+                extracted = download_core_release(release)
+            except Exception as e:
+                root.after(0, lambda: finish_download(error_text=str(e)))
+                return
+            root.after(0, lambda: finish_download(extracted=extracted))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    download_btn = ttk.Button(button_frame, text="Скачать", command=start_download)
+    download_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+    cancel_btn = ttk.Button(button_frame, text="Отмена", command=close_dialog)
+    cancel_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+
 def update_proxy_info(profile_name):
     global current_profile_info
     
@@ -255,12 +531,16 @@ def update_ui_state(is_running):
         toggle_btn.config(text="Stop Xray", command=stop_xray)
         add_btn.config(state="disabled")
         del_btn.config(state="disabled")
+        core_btn.config(state="disabled")
+        tun_check.config(state="disabled")
         profile_listbox.config(state="disabled")
     else:
         status_label.config(text="🔴 Xray не запущен", foreground="red")
         toggle_btn.config(text="Start Xray", command=start_xray)
         add_btn.config(state="normal")
         del_btn.config(state="normal")
+        core_btn.config(state="normal")
+        tun_check.config(state="normal")
         profile_listbox.config(state="normal")
 
 
@@ -283,18 +563,30 @@ def start_xray():
         messagebox.showerror("Ошибка", f"Файл конфига не найден: {config_file}")
         return
 
+    tun_enabled = tun_var.get()
+    if tun_enabled:
+        confirmed = messagebox.askyesno(
+            "TUN режим",
+            "TUN режим изменяет системную маршрутизацию и обычно требует запуск от администратора.\nПродолжить?",
+        )
+        if not confirmed:
+            return
+
     try:
+        config_file = create_runtime_config(config_file, tun_enabled)
         xray_process = subprocess.Popen(
-            ["xray.exe", "-config", config_file],
+            [get_xray_path(), "-config", os.path.abspath(config_file)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             universal_newlines=True,
-            creationflags=0x08000000
+            creationflags=0x08000000,
+            cwd=get_app_dir(),
         )
     except Exception as e:
         messagebox.showerror("Ошибка", f"Не удалось запустить Xray:\n{e}")
+        cleanup_runtime_config()
         xray_process = None
         return
 
@@ -330,6 +622,7 @@ def stop_xray():
         xray_process.terminate()
         xray_process.wait()
         xray_process = None
+        cleanup_runtime_config()
         update_ui_state(False)
         
         # Очищаем информацию о прокси при остановке
@@ -341,11 +634,19 @@ def stop_xray():
         messagebox.showinfo("Инфо", "Xray не запущен")
 
 
+def on_close():
+    if xray_process:
+        stop_xray()
+    cleanup_runtime_config()
+    root.destroy()
+
+
 # Создаем основное окно
 root = tk.Tk()
 root.title("VLESS → Xray Launcher")
 root.geometry("900x650")
 root.resizable(False, False)
+root.protocol("WM_DELETE_WINDOW", on_close)
 
 style = ttk.Style(root)
 style.theme_use("clam")
@@ -373,6 +674,9 @@ add_btn.pack(side="left", fill="x", expand=True, padx=5)
 del_btn = ttk.Button(btn_frame, text="Удалить профиль", command=delete_selected_profile)
 del_btn.pack(side="left", fill="x", expand=True, padx=5)
 
+core_btn = ttk.Button(left_top_frame, text="Загрузить ядро", command=show_core_download_dialog)
+core_btn.pack(fill="x", padx=5, pady=(0, 5))
+
 # Центральная часть верхнего фрейма (кнопка старт/стоп и статус)
 center_top_frame = ttk.Frame(top_frame, width=150)
 center_top_frame.pack(side="left", fill="y", padx=10)
@@ -382,6 +686,10 @@ toggle_btn.pack(pady=(40, 5))
 
 status_label = ttk.Label(center_top_frame, text="🔴 Xray не запущен", foreground="red")
 status_label.pack()
+
+tun_var = tk.BooleanVar(value=False)
+tun_check = ttk.Checkbutton(center_top_frame, text="TUN режим", variable=tun_var)
+tun_check.pack(pady=(10, 0))
 
 # Правая часть верхнего фрейма (информация о прокси)
 proxy_info_frame = ttk.LabelFrame(top_frame, text="Информация о прокси", padding=10, width=250)
