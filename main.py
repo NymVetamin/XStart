@@ -25,7 +25,7 @@ current_profile_info = {}
 runtime_config_file = None
 log_queue = queue.Queue()
 current_tun_enabled = False
-current_tun_bypass_prefixes = []
+current_tun_routes = []
 
 profiles = {}
 
@@ -39,7 +39,7 @@ MAX_RELEASES_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_VLESS_URL_LENGTH = 4096
 MAX_PROFILE_NAME_LENGTH = 80
 TUN_INTERFACE_NAME = "xstart0"
-TUN_ROUTES = ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]
+TUN_ROUTES = ["0.0.0.0/0", "::/0"]
 WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
 WINTUN_SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
 WINTUN_ZIP_MAX_BYTES = 8 * 1024 * 1024
@@ -74,7 +74,7 @@ def cleanup_runtime_config():
     runtime_config_file = None
 
 
-def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
+def create_runtime_config(config_file, tun_enabled):
     global runtime_config_file
     cleanup_runtime_config()
 
@@ -83,14 +83,6 @@ def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
 
     with open(config_file, "r", encoding="utf-8") as f:
         config = json.load(f)
-
-    config["dns"] = {
-        "servers": [
-            {"address": "1.1.1.1", "port": 53},
-            {"address": "8.8.8.8", "port": 53},
-        ],
-        "queryStrategy": "UseIP",
-    }
 
     config.setdefault("inbounds", []).append(
         {
@@ -102,7 +94,7 @@ def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
                 "gateway": ["10.19.0.1/30", "fc00::1/126"],
                 "dns": ["1.1.1.1", "8.8.8.8"],
                 "autoSystemRoutingTable": TUN_ROUTES,
-                "autoOutboundsInterface": outbound_interface or "auto",
+                "autoOutboundsInterface": "auto",
             },
             "sniffing": {
                 "enabled": True,
@@ -111,32 +103,42 @@ def create_runtime_config(config_file, tun_enabled, outbound_interface="auto"):
         }
     )
 
-    outbounds = config.setdefault("outbounds", [])
-    if not any(outbound.get("tag") == "dns-out" for outbound in outbounds):
-        outbounds.append({"tag": "dns-out", "protocol": "dns"})
-
     routing = config.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
-    has_dns_rule = any(rule.get("outboundTag") == "dns-out" and "tun-in" in rule.get("inboundTag", []) for rule in rules if isinstance(rule.get("inboundTag"), list))
-    if not has_dns_rule:
-        rules.insert(
-            0,
-            {
-                "type": "field",
-                "inboundTag": ["tun-in"],
-                "network": "tcp,udp",
-                "port": "53",
-                "outboundTag": "dns-out",
-            },
-        )
-        has_dns_rule = True
+    outbounds = config.setdefault("outbounds", [])
+    if not any(outbound.get("tag") == "block" for outbound in outbounds):
+        outbounds.append({"tag": "block", "protocol": "blackhole"})
+
+    local_tun_ips = [
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    ]
+    has_tun_block_rule = any(
+        rule.get("outboundTag") == "block" and "tun-in" in rule.get("inboundTag", [])
+        for rule in rules
+        if isinstance(rule.get("inboundTag"), list)
+    )
+    if not has_tun_block_rule:
+        rules.insert(0, {"type": "field", "inboundTag": ["tun-in"], "ip": local_tun_ips, "outboundTag": "block"})
+        has_tun_block_rule = True
+
     has_tun_rule = any(
         rule.get("outboundTag") == "vless-reality" and "tun-in" in rule.get("inboundTag", [])
         for rule in rules
         if isinstance(rule.get("inboundTag"), list)
     )
     if not has_tun_rule:
-        rules.insert(1 if has_dns_rule else 0, {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "vless-reality"})
+        rules.insert(1 if has_tun_block_rule else 0, {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "vless-reality"})
 
     fd, runtime_path = tempfile.mkstemp(prefix="xstart-runtime-", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -749,41 +751,35 @@ def resolve_endpoint_ips(host):
     return ips
 
 
-def prepare_tun_bypass_routes(host):
+def prepare_tun_endpoint_routes(host):
     ips = resolve_endpoint_ips(host)
     if not ips:
-        raise RuntimeError(f"Не удалось определить IP сервера {host} для защиты от TUN-loop")
+        raise RuntimeError(f"Cannot resolve proxy endpoint for TUN routing: {host}")
 
-    ps_ips = "@(" + ",".join(f'"{ip}"' for ip in ips) + ")"
+    ps_ips = "@(" + ",".join(json.dumps(ip) for ip in ips) + ")"
     script = f"""
 $ErrorActionPreference = 'Stop'
 $ips = {ps_ips}
 $added = @()
-$interfaceAlias = $null
 
 try {{
     foreach ($ip in $ips) {{
         $best = Find-NetRoute -RemoteIPAddress $ip -ErrorAction Stop |
+            Where-Object {{ $_.InterfaceAlias -ne '{TUN_INTERFACE_NAME}' }} |
             Sort-Object -Property RouteMetric, InterfaceMetric |
             Select-Object -First 1
-        if (-not $best) {{ throw "No route to endpoint $ip" }}
-        if ($best.InterfaceAlias -eq '{TUN_INTERFACE_NAME}') {{ throw "Endpoint $ip is already routed through TUN before start" }}
-        if (-not $interfaceAlias) {{ $interfaceAlias = $best.InterfaceAlias }}
+        if (-not $best) {{ throw "No physical route to endpoint $ip" }}
 
         if ($ip.Contains(':')) {{
             $prefix = "$ip/128"
-            $existing = Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
-            if (-not $existing) {{
-                New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $best.InterfaceIndex -NextHop $best.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-                $added += $prefix
-            }}
         }} else {{
             $prefix = "$ip/32"
-            $existing = Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
-            if (-not $existing) {{
-                New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $best.InterfaceIndex -NextHop $best.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-                $added += $prefix
-            }}
+        }}
+        $existing = Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.InterfaceIndex -eq $best.InterfaceIndex }}
+        if (-not $existing) {{
+            New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $best.InterfaceIndex -NextHop $best.NextHop -RouteMetric 4242 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+            $added += $prefix
         }}
     }}
 }} catch {{
@@ -795,28 +791,105 @@ try {{
 }}
 
 [pscustomobject]@{{
-    InterfaceAlias = $interfaceAlias
     AddedPrefixes = $added
+    EndpointIPs = $ips
 }} | ConvertTo-Json -Compress
 """
-    output = run_powershell_script(script, timeout=20)
-    data = json.loads(output)
+    data = json.loads(run_powershell_script(script, timeout=20))
+    prefixes = data.get("AddedPrefixes", [])
+    endpoint_ips = data.get("EndpointIPs", ips)
+    if isinstance(prefixes, str):
+        prefixes = [prefixes]
+    if isinstance(endpoint_ips, str):
+        endpoint_ips = [endpoint_ips]
+    return prefixes, endpoint_ips
+
+
+def configure_tun_adapter_routes():
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$adapter = $null
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {{
+    $adapter = Get-NetAdapter -Name '{TUN_INTERFACE_NAME}' -ErrorAction SilentlyContinue
+    if ($adapter) {{ break }}
+    Start-Sleep -Milliseconds 250
+}}
+if (-not $adapter) {{ throw "TUN adapter '{TUN_INTERFACE_NAME}' was not created" }}
+$ifIndex = $adapter.ifIndex
+
+function Invoke-WithRetry([scriptblock]$Action, [string]$Name) {{
+    $lastError = $null
+    for ($i = 0; $i -lt 30; $i++) {{
+        try {{
+            & $Action
+            return
+        }} catch {{
+            $lastError = $_
+            Start-Sleep -Milliseconds 300
+        }}
+    }}
+    throw "Failed to configure TUN $Name after retries: $lastError"
+}}
+
+function Invoke-Netsh([string[]]$NetshArgs, [string]$Name) {{
+    Invoke-WithRetry {{
+        $output = & netsh @NetshArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {{
+            throw "$Name failed with code $LASTEXITCODE`: $output"
+        }}
+    }} $Name
+}}
+
+Invoke-Netsh @('interface', 'ip', 'set', 'address', 'name="{TUN_INTERFACE_NAME}"', 'static', '10.19.0.1', '255.255.255.252') 'IPv4 address'
+Invoke-Netsh @('interface', 'ip', 'set', 'dns', 'name="{TUN_INTERFACE_NAME}"', 'static', '1.1.1.1', 'validate=no') 'primary DNS'
+Invoke-Netsh @('interface', 'ip', 'add', 'dns', 'name="{TUN_INTERFACE_NAME}"', '8.8.8.8', 'index=2', 'validate=no') 'secondary DNS'
+Invoke-WithRetry {{
+    $dns = Get-DnsClientServerAddress -InterfaceAlias '{TUN_INTERFACE_NAME}' -AddressFamily IPv4 -ErrorAction Stop
+    if ($dns.ServerAddresses -notcontains '1.1.1.1' -or $dns.ServerAddresses -notcontains '8.8.8.8') {{
+        throw "DNS was not applied"
+    }}
+}} 'DNS verification'
+Invoke-Netsh @('interface', 'ipv4', 'set', 'interface', '{TUN_INTERFACE_NAME}', 'metric=1') 'IPv4 metric'
+Invoke-Netsh @('interface', 'ipv6', 'set', 'interface', '{TUN_INTERFACE_NAME}', 'metric=1') 'IPv6 metric'
+
+$routes = @('0.0.0.0/0', '::/0')
+foreach ($prefix in $routes) {{
+    Get-NetRoute -DestinationPrefix $prefix -InterfaceIndex $ifIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    if ($prefix.Contains(':')) {{
+        Invoke-WithRetry {{ New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $ifIndex -NextHop '::' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null }} "route $prefix"
+    }} else {{
+        Invoke-WithRetry {{ New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $ifIndex -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null }} "route $prefix"
+    }}
+}}
+
+[pscustomobject]@{{ InterfaceIndex = $ifIndex; AddedPrefixes = $routes }} | ConvertTo-Json -Compress
+"""
+    data = json.loads(run_powershell_script(script, timeout=25))
     prefixes = data.get("AddedPrefixes", [])
     if isinstance(prefixes, str):
         prefixes = [prefixes]
-    return data.get("InterfaceAlias") or "auto", prefixes, ips
+    return prefixes
 
 
-def cleanup_tun_bypass_routes(prefixes):
+def cleanup_tun_routes(prefixes):
     if not prefixes:
         return
-    ps_prefixes = "@(" + ",".join(f'"{prefix}"' for prefix in prefixes) + ")"
+    ps_prefixes = "@(" + ",".join(json.dumps(prefix) for prefix in prefixes) + ")"
     script = f"""
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'SilentlyContinue'
 $prefixes = {ps_prefixes}
 foreach ($prefix in $prefixes) {{
-    Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    if ($prefix -eq '0.0.0.0/0' -or $prefix -eq '::/0') {{
+        Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.InterfaceAlias -eq '{TUN_INTERFACE_NAME}' }} |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    }} else {{
+        Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.RouteMetric -eq 4242 }} |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    }}
 }}
 """
     try:
@@ -883,19 +956,19 @@ def append_log_line(line):
 
 
 def handle_xray_exit(process, return_code):
-    global xray_process, stop_log_thread, current_tun_enabled, current_tun_bypass_prefixes
+    global xray_process, stop_log_thread, current_tun_enabled, current_tun_routes
     if xray_process is not process:
         return
 
     if current_tun_enabled:
-        cleanup_tun_bypass_routes(current_tun_bypass_prefixes)
-        current_tun_bypass_prefixes = []
-        current_tun_enabled = False
+        cleanup_tun_routes(current_tun_routes)
+        current_tun_routes = []
+    current_tun_enabled = False
     xray_process = None
     stop_log_thread = True
     cleanup_runtime_config()
     update_ui_state(False)
-    append_log_line(f"\nXray завершился с кодом {return_code}\n")
+    append_log_line(f"\nXray exited with code {return_code}\n")
 
 
 def poll_log_queue():
@@ -924,50 +997,46 @@ def clear_log_queue():
 
 
 def start_xray():
-    global xray_process, stop_log_thread, log_thread, current_tun_enabled, current_tun_bypass_prefixes
+    global xray_process, stop_log_thread, log_thread, current_tun_enabled, current_tun_routes
 
     if xray_process is not None:
-        messagebox.showwarning("Предупреждение", "Xray уже запущен")
+        messagebox.showwarning("Warning", "Xray is already running")
         return
 
     selected = profile_listbox.curselection()
     if not selected:
-        messagebox.showerror("Ошибка", "Выберите профиль для запуска")
+        messagebox.showerror("Error", "Select a profile to start")
         return
 
     profile_name = profile_listbox.get(selected[0])
     config_file = profiles[profile_name]["config_file"]
 
     if not os.path.exists(config_file):
-        messagebox.showerror("Ошибка", f"Файл конфига не найден: {config_file}")
+        messagebox.showerror("Error", f"Config file not found: {config_file}")
         return
 
     tun_enabled = tun_var.get()
-    outbound_interface = "auto"
-    bypass_ips = []
+    pending_tun_routes = []
+    endpoint_ips = []
     if tun_enabled:
         confirmed = messagebox.askyesno(
-            "TUN режим",
-            "TUN режим изменяет системную маршрутизацию и обычно требует запуск от администратора.\nПродолжить?",
+            "TUN mode",
+            "TUN mode changes Windows routing and usually requires administrator rights. Continue?",
         )
         if not confirmed:
             return
         if not ensure_wintun_for_tun():
             return
         try:
-            outbound_interface, current_tun_bypass_prefixes, bypass_ips = prepare_tun_bypass_routes(profiles[profile_name]["info"]["server"])
+            endpoint_routes, endpoint_ips = prepare_tun_endpoint_routes(profiles[profile_name]["info"]["server"])
+            pending_tun_routes.extend(endpoint_routes)
         except Exception as e:
-            messagebox.showerror(
-                "Ошибка",
-                "Не удалось подготовить маршрут до сервера перед TUN.\n"
-                "Без этого возникает петля: Xray пытается подключиться к своему серверу через TUN.\n"
-                f"{e}",
-            )
-            current_tun_bypass_prefixes = []
+            cleanup_tun_routes(pending_tun_routes)
+            messagebox.showerror("Error", f"Failed to prepare TUN endpoint routes:\n{e}")
             return
 
     try:
-        config_file = create_runtime_config(config_file, tun_enabled, outbound_interface)
+        config_file = create_runtime_config(config_file, tun_enabled)
         xray_process = subprocess.Popen(
             [get_xray_path(), "-config", os.path.abspath(config_file)],
             stdout=subprocess.PIPE,
@@ -978,16 +1047,26 @@ def start_xray():
             creationflags=0x08000000,
             cwd=get_app_dir(),
         )
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось запустить Xray:\n{e}")
         if tun_enabled:
-            cleanup_tun_bypass_routes(current_tun_bypass_prefixes)
-            current_tun_bypass_prefixes = []
+            pending_tun_routes.extend(configure_tun_adapter_routes())
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to start Xray:\n{e}")
+        if xray_process is not None:
+            try:
+                xray_process.terminate()
+                xray_process.wait(timeout=5)
+            except Exception:
+                try:
+                    xray_process.kill()
+                except Exception:
+                    pass
+        cleanup_tun_routes(pending_tun_routes)
         cleanup_runtime_config()
         xray_process = None
         return
 
     current_tun_enabled = tun_enabled
+    current_tun_routes = pending_tun_routes
     update_ui_state(True)
     update_proxy_info(profile_name)
 
@@ -1016,19 +1095,18 @@ def start_xray():
         log_queue.put(
             (
                 "line",
-                "\n[ TUN ] "
-                f"outbound interface: {outbound_interface}; endpoint IPs: {', '.join(bypass_ips)}; "
-                f"bypass routes: {', '.join(current_tun_bypass_prefixes) or 'already present'}\n",
+                "\n[ TUN ] Windows routes active: endpoint="
+                f"{', '.join(endpoint_ips)}; routes={', '.join(current_tun_routes)}\n",
             )
         )
 
 
 def stop_xray():
-    global xray_process, stop_log_thread, current_tun_enabled, current_tun_bypass_prefixes
+    global xray_process, stop_log_thread, current_tun_enabled, current_tun_routes
     if xray_process:
         if current_tun_enabled:
-            cleanup_tun_bypass_routes(current_tun_bypass_prefixes)
-            current_tun_bypass_prefixes = []
+            cleanup_tun_routes(current_tun_routes)
+            current_tun_routes = []
         stop_log_thread = True
         xray_process.terminate()
         try:
@@ -1041,13 +1119,12 @@ def stop_xray():
         cleanup_runtime_config()
         update_ui_state(False)
         
-        # Очищаем информацию о прокси при остановке
         for widget in proxy_info_frame.winfo_children():
             widget.destroy()
-        ttk.Label(proxy_info_frame, text="Информация о подключении", font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(0, 5))
-        ttk.Label(proxy_info_frame, text="Прокси не активен").pack(anchor='w')
+        ttk.Label(proxy_info_frame, text="Connection info", font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(0, 5))
+        ttk.Label(proxy_info_frame, text="Proxy is not active").pack(anchor='w')
     else:
-        messagebox.showinfo("Инфо", "Xray не запущен")
+        messagebox.showinfo("Info", "Xray is not running")
 
 
 def on_close():
