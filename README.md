@@ -1,44 +1,34 @@
-# 🧭 XStart (Xray GUI Launcher)
+# XStart
 
-Графическое приложение для Windows, которое позволяет удобно управлять VLESS-профилями и запускать `xray.exe` через простой интерфейс.
+Windows GUI launcher for Xray VLESS profiles.
 
-## 📦 Возможности
+## Features
 
-- Создание конфигураций Xray клиента на основе VLESS-ссылки
-- Автоматическое сохранение конфигураций в виде `.json` файлов
-- Отображение информации о текущем прокси-соединении
-- Запуск и остановка Xray одним нажатием
-- Просмотр логов Xray в реальном времени прямо в окне
-- SOCKS5-прокси по адресу `127.0.0.1:10808`
+- Import profiles from a `vless://` link.
+- Import profiles from a full Xray JSON config that contains a VLESS outbound.
+- Start and stop local `xray.exe`.
+- Local SOCKS proxy on `127.0.0.1:10808`.
+- Optional Windows TUN mode for routing machine traffic through Xray.
+- Download official Xray-core releases and Wintun with hash checks.
 
-## 🚀 Как использовать
+## Runtime Files
 
-1. **Загрузите [XStart.exe](XStart.exe) из этого репозитория и xray клиент из официального репозитория: [GitHub](https://github.com/XTLS/Xray-core/releases)**
-2. **Поместите `xray.exe` рядом с `XStart.exe` или скачайте его через кнопку загрузки ядра.**
-3. **Запустите приложение**
-4. **Добавление профиля:**
-   - Скопируйте VLESS-ссылку
-   - Нажмите кнопку **«Добавить профиль из буфера»**
-   - Профиль появится в списке
+Keep these files next to `XStart.exe`:
 
-5. **Запуск Xray:**
-   - Выделите нужный профиль в списке
-   - Нажмите **Start Xray**
-   - Статус изменится на 🟢 Xray запущен
+- `xray.exe`
+- `geoip.dat`
+- `geosite.dat`
+- `wintun.dll` for TUN mode
 
-6. **Использование прокси:**
-   - Настройте ваше приложение или браузер на SOCKS5 прокси:
-     - Адрес: `127.0.0.1`
-     - Порт: `10808`
-     - Без авторизации
+The app can download `xray.exe`, `geoip.dat`, `geosite.dat`, and `wintun.dll` through the `Download core` button.
 
-## 📁 Структура проекта
+## TUN Mode
 
-- `configs/` — папка с `.json` конфигами профилей
-- `main.py` — основной GUI-скрипт
-- `XStart.exe` — основной GUI-бинарник
-- `xray.exe` — бинарник клиента xray (не включён)
+Xray `v26.3.27` creates the Wintun adapter but does not apply Windows routes itself. XStart prepares the required Windows routing:
 
-Для корректной работы роутинга нужны файлы `geoip.dat` и `geosite.dat`, которые входят в комплект Xray и должны лежать рядом с `xray.exe`. Для TUN режима на Windows также нужен `wintun.dll`.
+- a precise host route to the proxy endpoint through the physical network;
+- DNS and interface metric for `xstart0`;
+- `0.0.0.0/0` and `::/0` routes through `xstart0`;
+- cleanup of the routes on stop or failed start.
 
-Загрузить Xray можно с [GitHub](https://github.com/XTLS/Xray-core/releases).
+TUN mode usually requires running XStart as administrator.
